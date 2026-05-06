@@ -1,0 +1,15 @@
+{
+  "name": "makid-web-play",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "publish:data": "python3 makid_publish_web_audio_v0_3.py"
+  },
+  "devDependencies": {
+    "vite": "^8.0.10"
+  }
+}
