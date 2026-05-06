@@ -79,19 +79,22 @@ Do not put a path like `/makid-web-play/` in the OAuth origin.
 
 The app expects a private Google Drive file containing the exported MAKID web library JSON.
 
-Current exporter output:
+The publisher creates this file automatically. It writes a local copy here:
 
 ```text
 ~/Library/Application Support/makid/web_export/WebAudioFile.json
 ```
 
-To use it privately:
+Then it creates or updates a private Google Drive file named `WebAudioFile.json`.
 
-1. Put `WebAudioFile.json` somewhere in your Google Drive.
-2. Keep the file private, or share it only with accounts that should access the library.
-3. Open the file in Google Drive web.
-4. Copy the file ID from the URL.
-5. Put that ID in `VITE_LIBRARY_FILE_ID`.
+The first time the publisher creates the Drive file, it writes the new file ID into:
+
+```text
+.env.local
+.env.production
+```
+
+After that, future publisher runs update the same private Drive file in place.
 
 Example Drive URL:
 
@@ -117,6 +120,8 @@ npm run publish:data
 
 That script reads the local MAKID database, resolves Google Drive file IDs, and writes `WebAudioFile.json`.
 
+It also uploads the JSON to a private Google Drive file. No manual copy into Google Drive is needed.
+
 By default, the exporter uses:
 
 ```text
@@ -132,6 +137,16 @@ MAKID_SOURCE_DB=/path/to/MAKID.db
 MAKID_GOOGLE_CREDENTIALS_JSON=/path/to/google_credentials.json
 MAKID_GOOGLE_DRIVE_ROOT=/path/to/My Drive
 ```
+
+Upload settings can also be configured:
+
+```bash
+MAKID_UPLOAD_LIBRARY_JSON=1
+MAKID_LIBRARY_DRIVE_FILE_NAME=WebAudioFile.json
+MAKID_LIBRARY_DRIVE_FOLDER_ID=optional-google-drive-folder-id
+```
+
+If `VITE_LIBRARY_FILE_ID` is empty, the publisher creates the private Drive JSON file and fills in `VITE_LIBRARY_FILE_ID` for you. Commit and push `.env.production` after that so GitHub Pages knows which private Drive file to request.
 
 The exporter does not copy `WebAudioFile.json` into `public/` unless `MAKID_COPY_TO_WEB_APP_FOLDER` is set. The app no longer uses a public copy.
 
