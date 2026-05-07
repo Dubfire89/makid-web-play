@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "publish:data": "python3 makid_publish_web_audio_v0_3.py"
+    "publish:data": "python3 makid_publish_web_audio_v0_3.py",
+    "auto:install": "scripts/install_makid_auto_publish.sh",
+    "auto:uninstall": "scripts/uninstall_makid_auto_publish.sh"
   },
   "devDependencies": {
     "vite": "^8.0.10"

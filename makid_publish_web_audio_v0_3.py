@@ -6,6 +6,7 @@
 # - Reads your local MAKID.db
 # - Extracts one clean web table
 # - Looks up Google Drive file IDs from your local Google Drive paths
+# - Reuses cached Drive file IDs for unchanged audio rows
 # - Writes WebAudioFile.json
 # - Creates or updates a private WebAudioFile.json in Google Drive
 #
@@ -30,8 +31,8 @@ from typing import Any, Dict, List, Optional, Tuple
 VERSION = "0.3"
 PROJECT_FOLDER = Path(__file__).resolve().parent
 ENV_CONFIG_FILES = [
-    PROJECT_FOLDER / ".env.local",
     PROJECT_FOLDER / ".env.production",
+    PROJECT_FOLDER / ".env.local",
 ]
 
 
@@ -110,6 +111,7 @@ COPY_TO_WEB_APP_FOLDER = optional_path_from_config("MAKID_COPY_TO_WEB_APP_FOLDER
 
 LIBRARY_DRIVE_FILE_NAME = config_value("MAKID_LIBRARY_DRIVE_FILE_NAME", "WebAudioFile.json") or "WebAudioFile.json"
 LIBRARY_DRIVE_FOLDER_ID = config_value("MAKID_LIBRARY_DRIVE_FOLDER_ID")
+LIBRARY_DRIVE_PATH = config_value("MAKID_LIBRARY_DRIVE_PATH")
 
 LOCAL_MY_DRIVE_PREFIX = str(
     path_from_config("MAKID_GOOGLE_DRIVE_ROOT", Path.home() / "My Drive")
@@ -259,6 +261,73 @@ def write_library_file_id_to_env_files(file_id: str) -> List[Path]:
         updated.append(path)
 
     return updated
+
+
+def previous_lookup_key(row: Dict[str, Any]) -> str:
+    return f"{row.get('file_id') or ''}\t{row.get('drive_relative_path') or ''}"
+
+
+def load_previous_rows_by_lookup_key() -> Dict[str, Dict[str, Any]]:
+    if not OUTPUT_JSON.exists():
+        return {}
+
+    try:
+        payload = json.loads(OUTPUT_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    rows = payload.get("rows")
+
+    if not isinstance(rows, list):
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for row in rows:
+        if isinstance(row, dict):
+            key = previous_lookup_key(row)
+
+            if key.strip():
+                result[key] = row
+
+    return result
+
+
+def can_reuse_previous_drive_lookup(row: Dict[str, Any], previous_row: Optional[Dict[str, Any]]) -> bool:
+    if not previous_row or not previous_row.get("drive_file_id"):
+        return False
+
+    if previous_row.get("drive_lookup_status") != "found":
+        return False
+
+    fields_that_must_match = [
+        "file_id",
+        "file_name",
+        "file_ext",
+        "drive_relative_path",
+        "file_hash",
+        "file_last_modified",
+        "file_size_bytes",
+    ]
+
+    return all(row.get(field) == previous_row.get(field) for field in fields_that_must_match)
+
+
+def apply_previous_drive_lookup(row: Dict[str, Any], previous_row: Dict[str, Any]) -> None:
+    drive_fields = [
+        "drive_file_id",
+        "drive_lookup_status",
+        "drive_name",
+        "drive_mime_type",
+        "drive_size_bytes",
+        "drive_modified_time",
+        "drive_md5_checksum",
+    ]
+
+    for field in drive_fields:
+        row[field] = previous_row.get(field)
+
+    row["drive_lookup_source"] = "cache"
 
 
 def fetch_rows(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -511,21 +580,35 @@ def fill_drive_file_ids(rows: List[Dict[str, Any]], service) -> None:
     print("Connecting to Google Drive...")
 
     resolver = DrivePathResolver(service)
+    previous_rows = load_previous_rows_by_lookup_key()
+    reuse_cached_lookups = is_truthy_config("MAKID_REUSE_DRIVE_LOOKUPS", "1")
 
     total = len(rows)
     found = 0
     missing = 0
+    cached = 0
+    looked_up = 0
 
     print("Looking up Google Drive file IDs...")
     print("")
 
     for index, row in enumerate(rows, start=1):
+        previous_row = previous_rows.get(previous_lookup_key(row))
+
+        if reuse_cached_lookups and can_reuse_previous_drive_lookup(row, previous_row):
+            apply_previous_drive_lookup(row, previous_row)
+            found += 1
+            cached += 1
+            print(f"[{index}/{total}] cached: {row.get('file_name')}")
+            continue
+
         relative_path = row.get("drive_relative_path")
 
         drive_file_id, status, metadata = resolver.resolve_drive_relative_path(relative_path)
 
         row["drive_file_id"] = drive_file_id
         row["drive_lookup_status"] = status
+        row["drive_lookup_source"] = "api"
 
         if metadata:
             row["drive_name"] = metadata.get("name")
@@ -545,10 +628,14 @@ def fill_drive_file_ids(rows: List[Dict[str, Any]], service) -> None:
         else:
             missing += 1
 
+        looked_up += 1
         print(f"[{index}/{total}] {status}: {row.get('file_name')}")
 
     print("")
-    print(f"Drive lookup complete. Found: {found}. Missing: {missing}.")
+    print(
+        f"Drive lookup complete. Found: {found}. Missing: {missing}. "
+        f"Cached: {cached}. API lookups: {looked_up}."
+    )
 
 
 def write_json(rows: List[Dict[str, Any]]) -> None:
@@ -577,6 +664,136 @@ def copy_to_web_app_folder() -> Optional[Path]:
     return destination
 
 
+def split_drive_path(path: Optional[str]) -> Tuple[List[str], str]:
+    if not path:
+        return [], LIBRARY_DRIVE_FILE_NAME
+
+    parts = [part.strip() for part in path.strip("/").split("/") if part.strip()]
+
+    if not parts:
+        return [], LIBRARY_DRIVE_FILE_NAME
+
+    return parts[:-1], parts[-1]
+
+
+def find_drive_child_folder(service, parent_id: str, folder_name: str) -> Optional[Dict[str, Any]]:
+    escaped_name = google_query_escape(folder_name)
+    query = (
+        f"name = '{escaped_name}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and '{parent_id}' in parents "
+        f"and trashed = false"
+    )
+
+    response = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name)",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+
+    files = response.get("files", [])
+    return files[0] if files else None
+
+
+def ensure_drive_folder_path(service, folder_parts: List[str]) -> str:
+    parent_id = "root"
+
+    for folder_name in folder_parts:
+        existing_folder = find_drive_child_folder(service, parent_id, folder_name)
+
+        if existing_folder:
+            parent_id = existing_folder["id"]
+            continue
+
+        metadata = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+
+        created_folder = service.files().create(
+            body=metadata,
+            fields="id, name",
+            supportsAllDrives=True,
+        ).execute()
+
+        parent_id = created_folder["id"]
+
+    return parent_id
+
+
+def find_drive_file_in_folder(service, parent_id: str, file_name: str) -> Optional[Dict[str, Any]]:
+    escaped_name = google_query_escape(file_name)
+    query = (
+        f"name = '{escaped_name}' "
+        f"and '{parent_id}' in parents "
+        f"and trashed = false"
+    )
+
+    response = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name, webViewLink, modifiedTime)",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+
+    files = response.get("files", [])
+    return files[0] if files else None
+
+
+def library_drive_target(service) -> Tuple[str, str]:
+    folder_parts, file_name = split_drive_path(LIBRARY_DRIVE_PATH)
+
+    if folder_parts:
+        return ensure_drive_folder_path(service, folder_parts), file_name
+
+    folder_id = clean_file_id(LIBRARY_DRIVE_FOLDER_ID)
+
+    if folder_id:
+        return folder_id, file_name
+
+    return "root", file_name
+
+
+def update_existing_library_json_file(service, file_id: str, media) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    add_parents = None
+    remove_parents = None
+
+    if LIBRARY_DRIVE_PATH or clean_file_id(LIBRARY_DRIVE_FOLDER_ID):
+        parent_id, file_name = library_drive_target(service)
+        current_file = service.files().get(
+            fileId=file_id,
+            fields="id, name, parents",
+            supportsAllDrives=True,
+        ).execute()
+
+        body["name"] = file_name
+
+        current_parents = current_file.get("parents", [])
+
+        if parent_id not in current_parents:
+            add_parents = parent_id
+            remove_parents = ",".join(current_parents) if current_parents else None
+
+    response = service.files().update(
+        fileId=file_id,
+        body=body or None,
+        media_body=media,
+        addParents=add_parents,
+        removeParents=remove_parents,
+        fields="id, name, webViewLink, modifiedTime",
+        supportsAllDrives=True,
+    ).execute()
+
+    return response
+
+
 def upload_library_json_to_drive(service) -> Optional[Dict[str, Any]]:
     if not is_truthy_config("MAKID_UPLOAD_LIBRARY_JSON", "1"):
         return None
@@ -599,12 +816,7 @@ def upload_library_json_to_drive(service) -> Optional[Dict[str, Any]]:
 
     if existing_file_id:
         try:
-            response = service.files().update(
-                fileId=existing_file_id,
-                media_body=media,
-                fields="id, name, webViewLink, modifiedTime",
-                supportsAllDrives=True,
-            ).execute()
+            response = update_existing_library_json_file(service, existing_file_id, media)
         except HttpError as error:
             status = getattr(getattr(error, "resp", None), "status", None)
 
@@ -621,13 +833,37 @@ def upload_library_json_to_drive(service) -> Optional[Dict[str, Any]]:
         write_library_file_id_to_env_files(response["id"])
         return response
 
-    metadata: Dict[str, Any] = {
-        "name": LIBRARY_DRIVE_FILE_NAME,
-        "mimeType": "application/json",
-    }
+    parent_id, file_name = library_drive_target(service)
+    existing_file_at_path = find_drive_file_in_folder(service, parent_id, file_name)
 
-    if clean_file_id(LIBRARY_DRIVE_FOLDER_ID):
-        metadata["parents"] = [clean_file_id(LIBRARY_DRIVE_FOLDER_ID)]
+    if existing_file_at_path:
+        try:
+            response = service.files().update(
+                fileId=existing_file_at_path["id"],
+                media_body=media,
+                fields="id, name, webViewLink, modifiedTime",
+                supportsAllDrives=True,
+            ).execute()
+        except HttpError as error:
+            status = getattr(getattr(error, "resp", None), "status", None)
+
+            if status in {403, 404}:
+                raise RuntimeError(
+                    "Found an existing private library JSON at the configured Drive path, "
+                    "but this OAuth app cannot update it. Move or rename that file, then "
+                    "run this publisher again so it can create and manage its own file."
+                ) from error
+
+            raise
+
+        write_library_file_id_to_env_files(response["id"])
+        return response
+
+    metadata: Dict[str, Any] = {
+        "name": file_name,
+        "mimeType": "application/json",
+        "parents": [parent_id],
+    }
 
     response = service.files().create(
         body=metadata,
