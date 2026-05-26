@@ -17,6 +17,7 @@ These files should not be public:
 - `MAKID.db`
 - Google OAuth client secrets.
 - Desktop OAuth credential JSON files.
+- Local Google OAuth token JSON files.
 - `WebAudioFile.json` with project names, track names, tags, genres, and Drive file IDs.
 
 `public/WebAudioFile.json` is ignored on purpose and should not be committed.
@@ -135,6 +136,7 @@ By default, the exporter uses:
 ```text
 ~/Library/Application Support/makid/MAKID.db
 ~/Library/Application Support/makid/google_credentials.json
+~/Library/Application Support/makid/google_drive_token.json
 ~/My Drive/
 ```
 
@@ -143,8 +145,11 @@ You can override those paths with environment variables:
 ```bash
 MAKID_SOURCE_DB=/path/to/MAKID.db
 MAKID_GOOGLE_CREDENTIALS_JSON=/path/to/google_credentials.json
+MAKID_GOOGLE_TOKEN_JSON=/path/to/google_drive_token.json
 MAKID_GOOGLE_DRIVE_ROOT=/path/to/My Drive
 ```
+
+Older versions stored the Google token in `google_drive_token.pickle`. The publisher no longer loads pickle tokens. If only the legacy pickle exists, the next `npm run publish:data` run opens a one-time Google approval window, writes a private JSON token, and removes the legacy pickle after the new token is saved.
 
 Upload settings can also be configured:
 
@@ -172,7 +177,21 @@ Install it:
 npm run auto:install
 ```
 
-This watches the local MAKID database file and also checks every five minutes. Before publishing, it fingerprints the `File` table. If the `File` table did not change, it skips `publish:data`.
+This watches the local MAKID database file and also checks every five minutes. Before publishing, it fingerprints the `File` table. If the `File` table did not change, it skips publishing.
+
+The installer creates a private runner here:
+
+```text
+~/Library/Application Support/makid/web-play-agent/
+```
+
+The runner stores expected SHA-256 hashes for the auto-publish shell script and Python publisher. If either guarded file changes, automatic publishing refuses to run until you review the change and rerun:
+
+```bash
+npm run auto:install
+```
+
+Automatic publishing invokes `/usr/bin/python3 makid_publish_web_audio_v0_3.py` directly instead of `npm run publish:data`, so changes to `package.json` are not part of the automatic execution path. Manual `npm run publish:data` still works.
 
 Logs are written to:
 
@@ -208,9 +227,23 @@ Then push to `main`. GitHub Actions builds the Vite app and deploys `dist/` to G
 
 ```bash
 npm run dev
+npm test
 npm run build
 npm run preview
 npm run publish:data
 npm run auto:install
 npm run auto:uninstall
+```
+
+## Security Notes
+
+The browser app still requests Google Drive `drive.readonly`. That is intentional for this pragmatic hardening pass because the static app fetches a private library JSON and audio files directly from Drive by file ID. Reducing that scope would require a larger Drive Picker/app-file or backend token-broker redesign.
+
+Local publisher secrets are written with private permissions where these scripts create or update them:
+
+```text
+~/Library/Application Support/makid/
+~/Library/Application Support/makid/web_export/WebAudioFile.json
+~/Library/Application Support/makid/google_credentials.json
+~/Library/Application Support/makid/google_drive_token.json
 ```

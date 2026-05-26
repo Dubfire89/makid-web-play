@@ -9,6 +9,7 @@
 # - Reuses cached Drive file IDs for unchanged audio rows
 # - Writes WebAudioFile.json
 # - Creates or updates a private WebAudioFile.json in Google Drive
+# - Stores Google OAuth tokens as private JSON, not pickle
 #
 # Required local file by default:
 # ~/Library/Application Support/makid/google_credentials.json
@@ -16,19 +17,19 @@
 # First run:
 # - A browser window opens
 # - You approve Google Drive read and file-write access
-# - A token is saved locally for next time
+# - A private JSON token is saved locally for next time
 
 import json
 import os
-import pickle
 import shutil
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+os.umask(0o077)
 
-VERSION = "0.3"
+VERSION = "0.4"
 PROJECT_FOLDER = Path(__file__).resolve().parent
 ENV_CONFIG_FILES = [
     PROJECT_FOLDER / ".env.production",
@@ -101,7 +102,11 @@ GOOGLE_CREDENTIALS_JSON = path_from_config(
     "MAKID_GOOGLE_CREDENTIALS_JSON",
     APP_SUPPORT_FOLDER / "google_credentials.json",
 )
-GOOGLE_TOKEN_PICKLE = path_from_config(
+GOOGLE_TOKEN_JSON = path_from_config(
+    "MAKID_GOOGLE_TOKEN_JSON",
+    APP_SUPPORT_FOLDER / "google_drive_token.json",
+)
+LEGACY_GOOGLE_TOKEN_PICKLE = path_from_config(
     "MAKID_GOOGLE_TOKEN_PICKLE",
     APP_SUPPORT_FOLDER / "google_drive_token.pickle",
 )
@@ -132,6 +137,42 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def chmod_private(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except FileNotFoundError:
+        return
+    except PermissionError as error:
+        raise PermissionError(f"Could not secure permissions for {path}: {error}") from error
+
+
+def ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    chmod_private(path, PRIVATE_DIR_MODE)
+
+
+def ensure_private_file(path: Path) -> None:
+    if path.exists():
+        chmod_private(path, PRIVATE_FILE_MODE)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    ensure_private_directory(path.parent)
+    path.write_text(text, encoding="utf-8")
+    chmod_private(path, PRIVATE_FILE_MODE)
+
+
+def secure_local_paths() -> None:
+    ensure_private_directory(APP_SUPPORT_FOLDER)
+    ensure_private_directory(OUTPUT_FOLDER)
+    ensure_private_file(GOOGLE_CREDENTIALS_JSON)
+    ensure_private_file(GOOGLE_TOKEN_JSON)
+    ensure_private_file(LEGACY_GOOGLE_TOKEN_PICKLE)
+
 
 def ensure_google_libraries() -> None:
     missing = []
@@ -145,6 +186,11 @@ def ensure_google_libraries() -> None:
         import google_auth_oauthlib.flow  # noqa: F401
     except Exception:
         missing.append("google-auth-oauthlib")
+
+    try:
+        import google.oauth2.credentials  # noqa: F401
+    except Exception:
+        missing.append("google-auth")
 
     try:
         import googleapiclient.discovery  # noqa: F401
@@ -453,14 +499,19 @@ def get_drive_service():
     ensure_google_libraries()
 
     from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
     creds = None
 
-    if GOOGLE_TOKEN_PICKLE.exists():
-        with GOOGLE_TOKEN_PICKLE.open("rb") as token_file:
-            creds = pickle.load(token_file)
+    if GOOGLE_TOKEN_JSON.exists():
+        creds = Credentials.from_authorized_user_file(str(GOOGLE_TOKEN_JSON), SCOPES)
+    elif LEGACY_GOOGLE_TOKEN_PICKLE.exists():
+        print("")
+        print("Found legacy Google token pickle.")
+        print("For security, pickle tokens are no longer loaded.")
+        print("Opening a new Google approval window and replacing it with a private JSON token...")
 
     if creds and hasattr(creds, "has_scopes") and not creds.has_scopes(SCOPES):
         print("")
@@ -470,18 +521,20 @@ def get_drive_service():
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
+        write_private_text(GOOGLE_TOKEN_JSON, creds.to_json() + "\n")
 
     if not creds or not creds.valid:
         if not GOOGLE_CREDENTIALS_JSON.exists():
             raise FileNotFoundError(f"Google credentials file not found: {GOOGLE_CREDENTIALS_JSON}")
 
+        ensure_private_file(GOOGLE_CREDENTIALS_JSON)
         flow = InstalledAppFlow.from_client_secrets_file(str(GOOGLE_CREDENTIALS_JSON), SCOPES)
         creds = flow.run_local_server(port=0)
+        write_private_text(GOOGLE_TOKEN_JSON, creds.to_json() + "\n")
 
-        GOOGLE_TOKEN_PICKLE.parent.mkdir(parents=True, exist_ok=True)
-
-        with GOOGLE_TOKEN_PICKLE.open("wb") as token_file:
-            pickle.dump(creds, token_file)
+    if LEGACY_GOOGLE_TOKEN_PICKLE.exists():
+        LEGACY_GOOGLE_TOKEN_PICKLE.unlink()
+        print(f"Removed legacy Google token pickle: {LEGACY_GOOGLE_TOKEN_PICKLE}")
 
     return build("drive", "v3", credentials=creds)
 
@@ -639,8 +692,6 @@ def fill_drive_file_ids(rows: List[Dict[str, Any]], service) -> None:
 
 
 def write_json(rows: List[Dict[str, Any]]) -> None:
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-
     payload = {
         "export_version": VERSION,
         "source_db": SOURCE_DB.name,
@@ -648,10 +699,7 @@ def write_json(rows: List[Dict[str, Any]]) -> None:
         "rows": rows,
     }
 
-    OUTPUT_JSON.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    write_private_text(OUTPUT_JSON, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
 def copy_to_web_app_folder() -> Optional[Path]:
@@ -880,6 +928,9 @@ def main() -> None:
     print(f"MAKID WebAudioFile publisher v{VERSION}")
     print(f"Source database: {SOURCE_DB}")
     print(f"Google credentials: {GOOGLE_CREDENTIALS_JSON}")
+    print(f"Google token JSON: {GOOGLE_TOKEN_JSON}")
+
+    secure_local_paths()
 
     if not SOURCE_DB.exists():
         raise FileNotFoundError(f"Source database not found: {SOURCE_DB}")

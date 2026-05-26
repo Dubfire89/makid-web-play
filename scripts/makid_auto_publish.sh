@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+umask 077
 
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
@@ -56,6 +57,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$STATE_DIR"
+chmod 700 "$APP_SUPPORT_DIR" "$STATE_DIR" 2>/dev/null || true
 sleep "$DELAY_SECONDS"
 
 fingerprint_file_table() {
@@ -99,12 +101,13 @@ if [[ -f "$FINGERPRINT_FILE" ]]; then
 fi
 
 if [[ "$fingerprint" == "$previous_fingerprint" ]]; then
-  echo "MAKID File table unchanged. Skipping publish:data."
+  echo "MAKID File table unchanged. Skipping publisher."
   exit 0
 fi
 
-echo "MAKID File table changed. Running publish:data..."
+echo "MAKID File table changed. Running publisher directly..."
 cd "$PROJECT_DIR"
-npm run publish:data
+/usr/bin/python3 "$PROJECT_DIR/makid_publish_web_audio_v0_3.py"
 echo "$fingerprint" > "$FINGERPRINT_FILE"
-echo "publish:data complete."
+chmod 600 "$FINGERPRINT_FILE" 2>/dev/null || true
+echo "Publisher complete."
