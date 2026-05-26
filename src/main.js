@@ -6,6 +6,7 @@ const LIBRARY_FILE_ID = import.meta.env.VITE_LIBRARY_FILE_ID || ''
 const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly'
 const DRIVE_MEDIA_URL_START = 'https://www.googleapis.com/drive/v3/files/'
 const EMPTY_FILTER_VALUE = '__empty__'
+const APP_VERSION = '0.4.0'
 
 const AUDIO_MIME_TYPES_BY_EXTENSION = {
   '.mp3': ['audio/mpeg'],
@@ -513,7 +514,10 @@ function renderApp() {
     <div class="page">
       <header class="topbar">
         <div class="brand">
-          <h1>MAKID Web Player</h1>
+          <div class="brandTitle">
+            <h1>MAKID Web Player</h1>
+            <span class="appVersion">v${APP_VERSION}</span>
+          </div>
           <p id="librarySummary"></p>
         </div>
 

@@ -61,11 +61,24 @@ select:disabled {
   min-width: 0;
 }
 
+.brandTitle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
 h1 {
   margin: 0;
   font-size: 30px;
   line-height: 1.08;
   letter-spacing: 0;
+}
+
+.appVersion {
+  color: #617080;
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .brand p {
